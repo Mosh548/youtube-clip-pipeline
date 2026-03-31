@@ -1,14 +1,135 @@
-# Node 3 — Peak Parser Implementation
+# Code Node Implementations
 
-This directory contains the implementation for Node 3 of the YouTube Peak Clip Pipeline.
+This directory contains the n8n Code node implementations for the YouTube Peak Clip Pipeline.
 
-## Overview
+## Implemented Nodes
+
+### Node 1b — Heatmap Data Transformer
+Transforms Apify actor output to pipeline format
+
+### Node 3 — Peak Parser
+Identifies top engagement peaks from heatmap data
+
+---
+
+## Node 1b — Heatmap Data Transformer
+
+### Overview
+Transforms the output from the Apify actor `karamelo/youtube-most-replayed-scraper-heatmap-extractor` into the standardized format expected by downstream pipeline nodes.
+
+### Files
+
+#### `node1-heatmap-transformer.js`
+The n8n Code node implementation. Copy the contents of this file directly into an n8n Code node placed immediately after the Apify HTTP Request node.
+
+**Input Format:**
+```javascript
+$input.first().json = [
+  {
+    videoId: "dQw4w9WgXcQ",
+    title: "Video Title",
+    heatSeek: [
+      {
+        startMillis: 47000,
+        durationMillis: 5000,
+        intensityScoreNormalized: 0.82
+      },
+      // ... more segments
+    ]
+  }
+]
+```
+
+**Output Format:**
+```javascript
+{
+  heatmapData: [
+    { timestamp_seconds: 47, engagement_score: 0.82 },
+    { timestamp_seconds: 112, engagement_score: 0.91 }
+    // ... more data points
+  ]
+}
+```
+
+#### `node1-heatmap-transformer-standalone.js`
+Standalone, testable version that can be used outside of n8n for development and testing.
+
+**Usage:**
+```javascript
+const { transformHeatmapData } = require('./node1-heatmap-transformer-standalone');
+
+const apifyResult = [
+  {
+    videoId: 'test',
+    heatSeek: [
+      { startMillis: 47000, durationMillis: 5000, intensityScoreNormalized: 0.82 }
+    ]
+  }
+];
+
+const result = transformHeatmapData(apifyResult);
+// Returns: { heatmapData: [{ timestamp_seconds: 47, engagement_score: 0.82 }] }
+```
+
+### Features
+
+#### Data Transformation
+- Converts `startMillis` (milliseconds) → `timestamp_seconds` (seconds) using floor rounding
+- Maps `intensityScoreNormalized` → `engagement_score`
+- Removes unnecessary fields (durationMillis, etc.)
+
+#### Error Handling
+- Validates Apify result is not empty
+- Checks for presence of heatSeek array
+- Throws descriptive errors for missing or invalid data
+- Helps identify videos without "Most Replayed" data
+
+#### Edge Cases Handled
+- Empty Apify responses
+- Videos without heatmap data
+- Null/undefined inputs
+- Large datasets (1000+ data points)
+- Edge values (0 and 1) for engagement scores
+
+### Testing
+
+Run the comprehensive test suite:
+
+```bash
+node tests/node1-heatmap-transformer.test.js
+```
+
+The test suite includes:
+- Basic transformation logic
+- Millisecond to second conversion with floor rounding
+- Output format validation
+- Error handling for various edge cases
+- Real-world scenario with full Apify output
+- Large dataset performance
+- Edge value preservation
+
+All 10 tests should pass.
+
+### Integration
+
+**Place in n8n Workflow:**
+```
+HTTP Request (Apify) → Code (Transformer) → Code (Peak Parser)
+```
+
+This node sits between Tool 1 (fetch_heatmap) and Tool 2 (parse_peaks).
+
+---
+
+## Node 3 — Peak Parser
+
+### Overview
 
 The Peak Parser identifies the top engagement peaks from YouTube heatmap data and returns them in a format suitable for n8n workflow processing.
 
-## Files
+### Files
 
-### `node3-peak-parser.js`
+#### `node3-peak-parser.js`
 The n8n Code node implementation. Copy the contents of this file directly into an n8n Code node.
 
 **Input Format:**
