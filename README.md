@@ -1,22 +1,37 @@
-# YouTube Peak Clip Pipeline — n8n Agent
+# YouTube Peak Clip Agent — n8n
 
-## Project Overview
+## What This Is
 
-An end-to-end automation pipeline that uses YouTube's "Most Replayed" heatmap data to identify the highest-engagement moments of a video, extract transcript-aware clip boundaries, and produce stitched short-form clips ready for Instagram Reels and TikTok.
+An AI-powered n8n agent that takes a YouTube URL, finds the highest-engagement moments using the "Most Replayed" heatmap, and produces finished short-form clips for Instagram Reels and TikTok — automatically.
+
+The agent is not a rigid linear pipeline. It has an AI brain (Google Gemini) that decides which tools to call, handles edge cases, and retries on failure — without hardcoded logic for every scenario.
 
 ---
 
-## Core Concept
+## How It Works
 
-YouTube exposes a "Most Replayed" heatmap on videos. This heatmap represents viewer re-watch density at each timestamp — a data signal for what audiences find most valuable. This pipeline:
+```
+You drop in a YouTube URL
+        ↓
+AI Agent reads the URL and begins orchestrating
+        ↓
+  ┌─────────────────────────────────────┐
+  │         AGENT TOOLBOX               │
+  │                                     │
+  │  1. Fetch heatmap data (Apify)      │
+  │  2. Parse top engagement peaks      │
+  │  3. Fetch transcript (Apify)        │
+  │  4. Find clip boundaries            │
+  │  5. Download source video (yt-dlp)  │
+  │  6. Clip segments (FFmpeg)          │
+  │  7. Stitch into reel (FFmpeg)       │
+  │  8. Save to output folder           │
+  └─────────────────────────────────────┘
+        ↓
+Final reel saved — ready to post
+```
 
-1. Extracts heatmap data as numeric timestamps (not pixels) via Apify
-2. Identifies the top N engagement peaks
-3. Pulls the video transcript and finds natural sentence boundaries around each peak
-4. Downloads the source video
-5. Clips each segment using FFmpeg
-6. Stitches clips into a single reel if total duration is below threshold
-7. Stores the final asset
+The agent decides the order of tool calls, handles fallbacks (e.g. no punctuation in transcript → use fixed window), and skips bad peaks automatically.
 
 ---
 
@@ -24,109 +39,138 @@ YouTube exposes a "Most Replayed" heatmap on videos. This heatmap represents vie
 
 | Layer | Tool | Purpose |
 |---|---|---|
-| Orchestration | n8n (self-hosted, Docker) | Pipeline workflow |
-| Heatmap Data | Apify | Scrape YouTube most-replayed data |
-| Transcript | YouTube Data API or Apify | Fetch auto-captions with timestamps |
+| Orchestration | n8n (self-hosted, npx, Windows) | Workflow engine |
+| Agent Brain | Google Gemini (free API) | Decision-making, edge case handling |
+| Heatmap Data | Apify | Scrape YouTube most-replayed as numeric data |
+| Transcript | Apify | Fetch auto-captions with timestamps |
 | Video Download | yt-dlp | Download source video |
 | Video Processing | FFmpeg | Clip and stitch segments |
-| Storage | Local volume or S3-compatible | Store final output |
+| Storage | Local Windows filesystem | Output folder |
+| MCP Integration | n8n-mcp | Gives AI coding agents deep n8n node knowledge |
 
 ---
 
-## Pipeline Architecture
+## Infrastructure
+
+- n8n runs locally via `npx n8n` on Windows
+- Accessible at: `https://n8n.chatsetgo.tech`
+- No Docker — direct npx install
+- FFmpeg and yt-dlp installed on host machine and callable via n8n Execute Command nodes
+- All credentials stored in n8n's built-in credential manager
+
+---
+
+## Agent Architecture
+
+### The Brain — n8n AI Agent Node
 
 ```
-[Trigger: YouTube URL input]
-        ↓
-[Step 1] Apify Actor → fetch heatmap data as JSON
-        ↓
-[Step 2] Parse heatmap → identify top N peaks (timestamps)
-        ↓
-[Step 3] Fetch transcript (YouTube API or Apify)
-        ↓
-[Step 4] For each peak → find sentence-start (walk back) and sentence-end (walk forward)
-        ↓
-[Step 5] Validate clip length → expand or trim to hit 30–90s target
-        ↓
-[Step 6] Execute node → yt-dlp downloads source video
-        ↓
-[Step 7] Execute node → FFmpeg clips each segment
-        ↓
-[Step 8] Check total stitched duration → if under 60s, stitch clips in chronological order
-        ↓
-[Step 9] Move final file to output directory / upload to storage
+Type: AI Agent (n8n built-in)
+Model: Google Gemini (via Gemini API credential)
+Memory: Window Buffer Memory (last 10 messages)
+Tools: [all nodes listed below wired as sub-tools]
+```
+
+**System Prompt for the Agent:**
+```
+You are a video clip production agent. Your job is to take a YouTube URL and produce
+short-form clips optimized for Instagram Reels and TikTok.
+
+Follow this process in order:
+1. Fetch the heatmap data for the URL using the fetch_heatmap tool
+2. Parse the top 5 engagement peaks, deduplicating any within 20 seconds of each other
+3. Fetch the video transcript using the fetch_transcript tool
+4. For each peak, find the nearest sentence boundary before it (walk back) and after it
+   (walk forward) using the find_boundaries tool. Target clip length: 30-90 seconds.
+   Fallback: if no punctuation found within 45s window, use +/-30s fixed window.
+5. Download the source video once using the download_video tool
+6. Clip each segment using the clip_video tool
+7. If total clip duration is under 25 seconds, stitch all clips chronologically using
+   the stitch_clips tool. Otherwise use the single best clip.
+8. Save the final file and return the output path.
+
+On any tool failure: retry once. If it fails again, skip that peak and continue.
+Always return a summary of what clips were created and why any peaks were skipped.
 ```
 
 ---
 
-## n8n Workflow — Node-by-Node Spec
+## Tools (Wired to Agent as Sub-Workflows or Code Nodes)
 
-### Node 1 — Webhook / Form Trigger
-- **Type:** Webhook or n8n Form
-- **Input:** YouTube video URL
-- **Output:** `{{ $json.url }}`
-
----
-
-### Node 2 — Apify: Fetch Heatmap Data
-- **Type:** HTTP Request
-- **Method:** POST
-- **URL:** `https://api.apify.com/v2/acts/<ACTOR_ID>/runs?token=<APIFY_TOKEN>`
-- **Body:**
+### Tool 1 — fetch_heatmap
+**Type:** HTTP Request
+**Purpose:** Call Apify actor to get YouTube most-replayed heatmap as numeric data
+**Method:** POST
+**URL:** `https://api.apify.com/v2/acts/<ACTOR_ID>/runs?token={{ $credentials.apify }}`
+**Body:**
 ```json
 {
   "startUrls": [{ "url": "{{ $json.url }}" }]
 }
 ```
-- **Expected Output:** JSON array of `{ timestamp_seconds: number, engagement_score: number }`
-- **⚠️ Validation required:** Confirm Apify actor returns numeric data points, not a screenshot. This is a hard dependency. Test this before building any downstream nodes.
+**Expected Output:** Array of `{ timestamp_seconds: number, engagement_score: number }`
+
+> ⚠️ VALIDATE FIRST: Confirm this actor returns numeric data points — not a screenshot or image. This is the entire data foundation. Do not build anything else until this is confirmed.
 
 ---
 
-### Node 3 — Code Node: Parse Peaks
-- **Type:** Code (JavaScript)
-- **Purpose:** Sort heatmap data by engagement score, return top N peaks
-- **Logic:**
+### Tool 2 — parse_peaks
+**Type:** Code Node (JavaScript)
+**Purpose:** Sort heatmap, deduplicate close peaks, return top N
+**Input:** `{ heatmapData: [{ timestamp_seconds, engagement_score }] }`
+**Output:** `{ peaks: [{ peak_timestamp: number }] }`
+
 ```javascript
 const heatmap = $input.first().json.heatmapData;
 const TOP_N = 5;
+const DEDUP_WINDOW = 20; // seconds
 
 const sorted = [...heatmap].sort((a, b) => b.engagement_score - a.engagement_score);
-const topPeaks = sorted.slice(0, TOP_N).map(p => p.timestamp_seconds);
 
-return topPeaks.map(ts => ({ peak_timestamp: ts }));
+const peaks = [];
+for (const item of sorted) {
+  const tooClose = peaks.some(p => Math.abs(p.peak_timestamp - item.timestamp_seconds) < DEDUP_WINDOW);
+  if (!tooClose) peaks.push({ peak_timestamp: item.timestamp_seconds });
+  if (peaks.length >= TOP_N) break;
+}
+
+return [{ peaks }];
 ```
-- **Output:** Array of `{ peak_timestamp }` objects (one item per peak, feeds into split/loop)
 
 ---
 
-### Node 4 — HTTP Request: Fetch Transcript
-- **Type:** HTTP Request
-- **Purpose:** Get YouTube auto-captions with word-level or line-level timestamps
-- **Option A (YouTube Data API):**
-  - Endpoint: `https://www.googleapis.com/youtube/v3/captions`
-  - Requires OAuth — complex setup
-- **Option B (Apify transcript actor):**
-  - Simpler, no OAuth needed
-  - Returns lines with `{ start: seconds, text: string }`
-- **Recommended for v1:** Option B (Apify)
-- **Output:** `{{ $json.transcript }}` — array of `{ start: number, text: string }`
+### Tool 3 — fetch_transcript
+**Type:** HTTP Request (Apify)
+**Purpose:** Fetch YouTube auto-captions with per-line timestamps
+**Method:** POST
+**URL:** `https://api.apify.com/v2/acts/<TRANSCRIPT_ACTOR_ID>/runs?token={{ $credentials.apify }}`
+**Body:**
+```json
+{
+  "videoUrl": "{{ $json.url }}"
+}
+```
+**Expected Output:** `{ transcript: [{ start: number, text: string }] }`
+
+> Recommended: Use Apify over YouTube Data API — no OAuth required, simpler setup.
 
 ---
 
-### Node 5 — Code Node: Find Clip Boundaries
-- **Type:** Code (JavaScript)
-- **Input:** `peak_timestamp` (from Node 3 loop) + full transcript (from Node 4)
-- **Purpose:** Walk backwards to sentence start, walk forwards to sentence end
-- **Logic:**
+### Tool 4 — find_boundaries
+**Type:** Code Node (JavaScript)
+**Purpose:** Walk transcript backwards and forwards from peak to find natural sentence boundaries
+**Input:** `{ peak_timestamp: number, transcript: [{ start, text }] }`
+**Output:** `{ in_point: number, out_point: number, peak_timestamp: number }`
+
 ```javascript
-const peak = $('Node3').first().json.peak_timestamp;
-const transcript = $('Node4').first().json.transcript;
+const peak = $input.first().json.peak_timestamp;
+const transcript = $input.first().json.transcript;
 
 const TARGET_MIN = 30;
 const TARGET_MAX = 90;
+const FALLBACK_WINDOW = 30;
 
-// Find transcript line closest to peak
+// Find closest transcript line to peak
 let peakIndex = 0;
 let minDiff = Infinity;
 transcript.forEach((line, i) => {
@@ -134,11 +178,12 @@ transcript.forEach((line, i) => {
   if (diff < minDiff) { minDiff = diff; peakIndex = i; }
 });
 
-// Walk backwards to sentence boundary (punctuation or silence gap > 0.5s)
+// Walk backwards to sentence boundary
 let startIndex = peakIndex;
 while (startIndex > 0) {
   const prevText = transcript[startIndex - 1].text.trim();
   if (/[.!?]$/.test(prevText)) break;
+  if (transcript[peakIndex].start - transcript[startIndex].start > FALLBACK_WINDOW) break;
   startIndex--;
 }
 
@@ -146,152 +191,115 @@ while (startIndex > 0) {
 let endIndex = peakIndex;
 while (endIndex < transcript.length - 1) {
   const currText = transcript[endIndex].text.trim();
-  const duration = transcript[endIndex + 1].start - transcript[startIndex].start;
+  const duration = transcript[endIndex].start - transcript[startIndex].start;
   if (/[.!?]$/.test(currText) && duration >= TARGET_MIN) break;
   if (duration >= TARGET_MAX) break;
   endIndex++;
 }
 
 const inPoint = transcript[startIndex].start;
-const outPoint = transcript[endIndex].start + 2; // add 2s buffer
+const outPoint = transcript[endIndex].start + 2; // 2s trailing buffer
 
 return [{ in_point: inPoint, out_point: outPoint, peak_timestamp: peak }];
 ```
-- **Output:** `{ in_point, out_point, peak_timestamp }`
 
 ---
 
-### Node 6 — Execute Command: Download Video
-- **Type:** Execute Command
-- **Runs once per workflow (not per peak)**
-- **Command:**
+### Tool 5 — download_video
+**Type:** Execute Command
+**Purpose:** Download source video once before clipping
+**Run once per workflow — not per peak**
+
 ```bash
-yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4" \
-  -o "/data/source/%(id)s.%(ext)s" \
-  "{{ $('Node1').first().json.url }}"
+yt-dlp -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]" -o "C:\data\source\%(id)s.%(ext)s" "{{ $json.url }}"
 ```
-- **Output:** Source video saved to `/data/source/<video_id>.mp4`
-- **⚠️ Note:** Run this node before the per-peak loop, not inside it
+
+**Output:** Source file at `C:\data\source\<video_id>.mp4`
 
 ---
 
-### Node 7 — Execute Command: FFmpeg Clip
-- **Type:** Execute Command (runs per peak via SplitInBatches)
-- **Command:**
+### Tool 6 — clip_video
+**Type:** Execute Command (runs per peak)
+**Purpose:** Cut a single segment from source video
+
 ```bash
-ffmpeg -i /data/source/<video_id>.mp4 \
-  -ss {{ $json.in_point }} \
-  -to {{ $json.out_point }} \
-  -c:v libx264 -c:a aac \
-  -avoid_negative_ts make_zero \
-  /data/clips/clip_{{ $json.peak_timestamp }}.mp4
+ffmpeg -i "C:\data\source\{{ $json.video_id }}.mp4" -ss {{ $json.in_point }} -to {{ $json.out_point }} -c:v libx264 -c:a aac -avoid_negative_ts make_zero "C:\data\clips\clip_{{ $json.peak_timestamp }}.mp4"
 ```
-- **Output:** Individual clips saved to `/data/clips/`
+
+**Output:** `C:\data\clips\clip_<timestamp>.mp4`
 
 ---
 
-### Node 8 — Code Node: Stitch Decision
-- **Type:** Code (JavaScript)
-- **Purpose:** Decide whether to stitch clips; if yes, sort chronologically and build FFmpeg concat list
-- **Logic:**
+### Tool 7 — stitch_clips
+**Type:** Execute Command (conditional — only if total duration < 25s)
+**Purpose:** Concatenate clips in chronological order into one reel
+
+The concat list is built by a Code node before this runs:
 ```javascript
 const clips = $input.all().map(item => item.json);
-const REEL_MIN = 25; // seconds — stitch if total is below this
-
-// Sort chronologically
 const sorted = clips.sort((a, b) => a.peak_timestamp - b.peak_timestamp);
+const concatList = sorted.map(c => `file 'C:/data/clips/clip_${c.peak_timestamp}.mp4'`).join('\n');
+return [{ concat_list: concatList, clip_count: sorted.length }];
+```
 
-const totalDuration = sorted.reduce((sum, c) => sum + (c.out_point - c.in_point), 0);
-
-if (totalDuration < REEL_MIN) {
-  // Build concat list for FFmpeg
-  const concatList = sorted.map(c => `file '/data/clips/clip_${c.peak_timestamp}.mp4'`).join('\n');
-  return [{ stitch: true, concat_list: concatList, clips: sorted }];
-} else {
-  // Use the single best clip
-  return [{ stitch: false, clips: [sorted[0]] }];
-}
+FFmpeg stitch command:
+```bash
+ffmpeg -f concat -safe 0 -i "C:\data\concat.txt" -c copy "C:\data\output\final_reel.mp4"
 ```
 
 ---
 
-### Node 9 — Execute Command: FFmpeg Stitch
-- **Type:** Execute Command (conditional — runs only if `stitch === true`)
-- **Command:**
-```bash
-echo "{{ $json.concat_list }}" > /data/concat.txt && \
-ffmpeg -f concat -safe 0 -i /data/concat.txt \
-  -c copy /data/output/final_reel.mp4
-```
-- **Output:** `/data/output/final_reel.mp4`
+### Tool 8 — save_output
+**Type:** Execute Command
+**Purpose:** Copy final reel to delivered folder with timestamp
 
----
-
-### Node 10 — Move / Upload Final File
-- **Type:** Execute Command or S3 node
-- **Purpose:** Move final reel to output directory or upload to storage bucket
-- **Command (local):**
 ```bash
-cp /data/output/final_reel.mp4 /data/delivered/reel_{{ $now }}.mp4
+copy "C:\data\output\final_reel.mp4" "C:\data\delivered\reel_%date:~-4%-%date:~3,2%-%date:~0,2%.mp4"
 ```
 
 ---
 
-## Docker Setup
+## Credentials Required
 
-### docker-compose.yml
-```yaml
-version: "3.8"
-services:
-  n8n:
-    image: n8nio/n8n
-    ports:
-      - "5678:5678"
-    environment:
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=admin
-      - N8N_BASIC_AUTH_PASSWORD=changeme
-      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
-    volumes:
-      - n8n_data:/home/node/.n8n
-      - ./data:/data          # shared video/clip storage
-    restart: unless-stopped
+Store all of these in n8n's credential manager — never hardcode in nodes.
 
-volumes:
-  n8n_data:
+| Credential | Type | Where to get it |
+|---|---|---|
+| `APIFY_TOKEN` | HTTP Header Auth | apify.com → Settings → API tokens |
+| `GEMINI_API_KEY` | Google Gemini API | aistudio.google.com/app/apikey — free tier available |
+
+---
+
+## Local File Structure (Windows)
+
+```
+C:\data\
+  source\       # Downloaded source videos (yt-dlp output)
+  clips\        # Individual clipped segments (FFmpeg output)
+  output\       # Final stitched reel (pre-delivery)
+  delivered\    # Archived final reels (timestamped)
+  concat.txt    # Temp FFmpeg concat list (overwritten each run)
 ```
 
-### Required host tools (inside n8n container or sidecar)
+Create these folders before first run:
 ```bash
-apt-get install -y ffmpeg
+mkdir C:\data\source C:\data\clips C:\data\output C:\data\delivered
+```
+
+---
+
+## Required Tools on Host Machine
+
+**yt-dlp:**
+```bash
 pip install yt-dlp
+yt-dlp --version
 ```
 
-Or run FFmpeg/yt-dlp in a separate sidecar container and call via HTTP or shared volume.
-
----
-
-## Environment Variables / Credentials
-
-| Variable | Description |
-|---|---|
-| `APIFY_TOKEN` | Apify API token |
-| `YOUTUBE_API_KEY` | YouTube Data API v3 key (if using transcript via Google) |
-| `OUTPUT_DIR` | Local path for final reels |
-
-Store all credentials in n8n's built-in credential manager — never hardcode in nodes.
-
----
-
-## File Structure
-
-```
-/data/
-  source/         # Downloaded source videos
-  clips/          # Individual clipped segments
-  output/         # Final stitched reels
-  delivered/      # Archived outputs
-  concat.txt      # Temp FFmpeg concat list (overwritten each run)
+**FFmpeg:**
+Download from ffmpeg.org/download.html → add to Windows PATH
+```bash
+ffmpeg -version
 ```
 
 ---
@@ -300,63 +308,108 @@ Store all credentials in n8n's built-in credential manager — never hardcode in
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Apify can't extract heatmap as numbers | Pipeline has no data foundation | **Validate this first, before building anything else** |
-| YouTube changes heatmap DOM structure | Apify actor breaks silently | Add response schema validation in Node 2; alert on unexpected shape |
-| Transcript has no punctuation | Boundary logic finds no sentence ends | Add fallback: if no punctuation found within 45s window, use silence gap or fixed ±30s window |
-| Two peaks are very close together | Overlapping or redundant clips | In Node 3, deduplicate peaks that are within 20s of each other |
-| yt-dlp rate limited or blocked | Download fails | Add retry logic; use cookies file for authenticated requests |
-| FFmpeg cuts on keyframe boundaries | Slight in/out drift | Add `-force_key_frames` or use `-c copy` only when re-encoding isn't needed |
+| Apify returns image not numbers for heatmap | Entire pipeline broken | Validate actor output shape before building anything else |
+| YouTube changes heatmap DOM | Apify actor silently breaks | Validate response schema in fetch_heatmap — agent alerts on unexpected shape |
+| Transcript has no punctuation | Boundary walker never breaks | Fallback: walk max 30s back/forward regardless of punctuation |
+| Two peaks very close together | Redundant or overlapping clips | Deduplication in parse_peaks (20s window) |
+| yt-dlp blocked or rate limited | Download fails | Agent retries once; add --cookies-from-browser chrome if needed |
+| FFmpeg keyframe drift | Clip starts/ends slightly off | Use -c:v libx264 re-encode for precise cuts, not -c copy |
+| Windows path spaces | FFmpeg/yt-dlp command fails | Always wrap all paths in double quotes |
 
 ---
 
-## V1 Defaults (Hardcode These, Tune Later)
+## V1 Config Defaults
 
-| Parameter | Default |
-|---|---|
-| Number of peaks (TOP_N) | 5 |
-| Minimum clip length | 30s |
-| Maximum clip length | 90s |
-| Stitch threshold | 25s total |
-| Clip order when stitching | Chronological |
-| Target content | English, clear audio |
-
-These defaults should be extracted into a single config object or n8n environment variables so they can be tuned without touching node logic.
+| Parameter | Default | Why |
+|---|---|---|
+| Top peaks (TOP_N) | 5 | Enough variety without overprocessing |
+| Dedup window | 20s | Avoids near-duplicate clips |
+| Minimum clip length | 30s | Minimum viable Reel |
+| Maximum clip length | 90s | TikTok/Reels sweet spot |
+| Fallback window | +/-30s | When transcript has no punctuation |
+| Stitch threshold | 25s | Stitch if best clip is too short |
+| Clip order | Chronological | Simplest for v1 |
 
 ---
 
-## V1 Scope (What's Intentionally Out)
+## V1 Scope — Intentionally Left Out
 
-- Captions / subtitles overlay
-- Music or background audio
-- Color grading or LUTs
-- Automatic upload to Instagram / TikTok
-- Audience feedback loop (v3 feature)
+- Captions / subtitle overlay
+- Background music
+- Color grading
+- Auto-upload to Instagram / TikTok
+- Audience feedback loop
 - Multi-language transcript support
+- Reordering clips by engagement strength (v2)
 
 ---
 
-## Validation Checklist Before First Run
+## Validation Checklist — Before First Run
 
-- [ ] Apify actor confirmed to return numeric heatmap data (not image)
-- [ ] Transcript output confirmed to include timestamps per line
-- [ ] FFmpeg installed and accessible inside n8n execution environment
-- [ ] yt-dlp installed and can download a test video
-- [ ] `/data/` directories created with correct permissions
-- [ ] n8n credentials saved for Apify and YouTube API
-- [ ] Test run on a single short video (under 10 min) before full pipeline
+- [ ] Apify heatmap actor confirmed to return `{ timestamp_seconds, engagement_score }` array
+- [ ] Apify transcript actor confirmed to return `{ start, text }` array per line
+- [ ] yt-dlp installed and working — `yt-dlp --version`
+- [ ] FFmpeg installed and in PATH — `ffmpeg -version`
+- [ ] `C:\data\` folder structure created
+- [ ] Gemini API key added to n8n credentials
+- [ ] Apify token added to n8n credentials
+- [ ] Agent tested on a single short video (under 5 min) before real content
 
 ---
 
-## Prompting Guide (For Claude / GitHub Copilot)
+## Development Setup
 
-When using this README to get AI help building nodes, provide context like this:
+This repo is built using the **Claude coding agent on GitHub** with **Copilot Agent mode in VS Code** and **n8n-mcp** connected for deep n8n node knowledge.
 
-> "I am building an n8n workflow. Here is my pipeline spec in README.md. Help me write the Code node logic for [Node X]. The input is [describe input shape]. The output should be [describe output shape]."
+### MCP Config (VS Code)
+```json
+{
+  "mcpServers": {
+    "n8n-mcp": {
+      "type": "http",
+      "url": "https://n8n.chatsetgo.tech/mcp-server/http",
+      "headers": {
+        "Authorization": "Bearer YOUR_N8N_API_KEY"
+      }
+    }
+  }
+}
+```
 
-For FFmpeg commands:
-> "Generate an FFmpeg command that clips a video from [in_point] to [out_point], re-encodes to H.264/AAC, and avoids negative timestamps."
+### GitHub Issue Template (use for each tool)
+```
+Title: Implement Tool [N] — [tool_name]
 
-For Apify:
-> "Write an n8n HTTP Request node configuration that calls the Apify actor run endpoint, polls for completion, and returns the dataset items."
-#   y o u t u b e - c l i p - p i p e l i n e  
- 
+Using README.md as the spec, implement [tool_name] as an n8n node.
+
+Input shape: { ... }
+Output shape: { ... }
+Rules:
+- [rule 1]
+- [rule 2]
+- [fallback behavior]
+
+This will be wired as a tool to the n8n AI Agent node.
+Assign to @claude.
+```
+
+### Copilot Agent Prompt Template
+```
+I am building an n8n AI agent workflow. The full spec is in README.md.
+Using #file:README.md, help me implement [tool name].
+Input: [shape]. Output: [shape].
+This runs as a tool node called by the AI Agent node.
+```
+
+---
+
+## Roadmap
+
+**V1 — Core pipeline** ← current
+URL in → clipped reel out. Manual review before posting.
+
+**V2 — Smarter selection**
+Reorder clips by engagement strength. Add score to output metadata.
+
+**V3 — Feedback loop**
+Connect Instagram/TikTok analytics. Agent tunes TOP_N, clip length, and order based on post performance.
